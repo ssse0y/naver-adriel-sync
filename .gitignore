@@ -1,0 +1,6 @@
+.clasp.json
+.clasprc.json
+.env
+credentials.json
+secrets.*
+
