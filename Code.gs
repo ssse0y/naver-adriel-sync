@@ -2,6 +2,7 @@ const NAVER_BASE_URL = 'https://api.searchad.naver.com';
 const OUTPUT_SHEET_NAME = 'Adriel_연동';
 const SHOPPING_CREATIVE_SHEET_NAME = '네이버_쇼핑소재';
 const TIME_ZONE = 'Asia/Seoul';
+const DATA_START_DATE = '2025-01-01';
 const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
 
 function createNaverSignature_(timestamp, method, uri, secretKey) {
@@ -290,6 +291,7 @@ function buildAdrielDailyBrandCosts() {
     yesterday.setDate(yesterday.getDate() - 1);
     const cutoffText = Utilities.formatDate(yesterday, TIME_ZONE, 'yyyy-MM-dd');
     const cutoffDate = createKstDate_(cutoffText);
+    const minimumOutputDate = createKstDate_(DATA_START_DATE);
     const campaignMap = {};
     campaigns.forEach(campaign => {
       campaignMap[campaign.nccCampaignId] = campaign;
@@ -324,10 +326,17 @@ function buildAdrielDailyBrandCosts() {
         const contractDays = Math.floor(
           (endDate.getTime() - startDate.getTime()) / MILLISECONDS_PER_DAY
         ) + 1;
-        if (contractDays <= 0 || startDate > cutoffDate) return;
+        if (
+          contractDays <= 0 ||
+          startDate > cutoffDate ||
+          endDate < minimumOutputDate
+        ) return;
+        const outputStartDate = startDate < minimumOutputDate
+          ? minimumOutputDate
+          : startDate;
         const outputEndDate = endDate > cutoffDate ? cutoffDate : endDate;
         const outputDays = Math.floor(
-          (outputEndDate.getTime() - startDate.getTime()) / MILLISECONDS_PER_DAY
+          (outputEndDate.getTime() - outputStartDate.getTime()) / MILLISECONDS_PER_DAY
         ) + 1;
         const netPaymentInclVat = Math.max(
           0,
@@ -339,7 +348,7 @@ function buildAdrielDailyBrandCosts() {
         const dailyCost = Math.round(totalCostExVat / contractDays);
         for (let dayIndex = 0; dayIndex < outputDays; dayIndex++) {
           const currentDate = new Date(
-            startDate.getTime() + dayIndex * MILLISECONDS_PER_DAY
+            outputStartDate.getTime() + dayIndex * MILLISECONDS_PER_DAY
           );
           const dateText = Utilities.formatDate(currentDate, TIME_ZONE, 'yyyy-MM-dd');
           const campaignId = campaign.nccCampaignId || '';
@@ -371,7 +380,10 @@ function buildAdrielDailyBrandCosts() {
       String(a[3]).localeCompare(String(b[3]))
     );
     writeAdrielSheet_(output);
-    console.log(`Adriel 업데이트 완료: ${output.length}행 / 기준일: ${cutoffText}`);
+    console.log(
+      `Adriel 업데이트 완료: ${output.length}행 / ` +
+      `조회기간: ${DATA_START_DATE}~${cutoffText}`
+    );
   } finally {
     lock.releaseLock();
   }
