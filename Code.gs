@@ -1,5 +1,6 @@
 const NAVER_BASE_URL = 'https://api.searchad.naver.com';
 const OUTPUT_SHEET_NAME = 'Adriel_연동';
+const SHOPPING_CREATIVE_SHEET_NAME = '네이버_쇼핑소재';
 const TIME_ZONE = 'Asia/Seoul';
 const MILLISECONDS_PER_DAY = 24 * 60 * 60 * 1000;
 
@@ -53,6 +54,219 @@ function naverGet_(uri, params = {}) {
   return JSON.parse(body);
 }
 
+function buildQueryString_(params = {}) {
+  return Object.entries(params)
+    .filter(([, value]) => value !== undefined && value !== null && value !== '')
+    .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
+    .join('&');
+}
+
+function naverGetBatch_(requests, batchSize = 20) {
+  const results = [];
+  for (let start = 0; start < requests.length; start += batchSize) {
+    const batch = requests.slice(start, start + batchSize);
+    const fetchRequests = batch.map(request => {
+      const query = buildQueryString_(request.params);
+      return {
+        url: NAVER_BASE_URL + request.uri + (query ? `?${query}` : ''),
+        method: 'get',
+        headers: getNaverHeaders_('GET', request.uri),
+        muteHttpExceptions: true
+      };
+    });
+    const responses = UrlFetchApp.fetchAll(fetchRequests);
+    responses.forEach((response, index) => {
+      const statusCode = response.getResponseCode();
+      const body = response.getContentText();
+      if (statusCode !== 200) {
+        const request = batch[index];
+        throw new Error(
+          `네이버 API 오류 ${statusCode}\n요청: ${request.uri}\n응답: ${body}`
+        );
+      }
+      results.push(JSON.parse(body));
+    });
+    if (start + batchSize < requests.length) Utilities.sleep(300);
+  }
+  return results;
+}
+
+function parseJsonValue_(value) {
+  if (value === null || value === undefined || value === '') return {};
+  if (typeof value === 'object') return value;
+  try {
+    return JSON.parse(value);
+  } catch (error) {
+    return { rawValue: String(value) };
+  }
+}
+
+function firstValue_(values) {
+  for (const value of values) {
+    if (value !== null && value !== undefined && value !== '') return value;
+  }
+  return '';
+}
+
+function sheetCellValue_(value) {
+  if (value === null || value === undefined) return '';
+  return typeof value === 'object' ? JSON.stringify(value) : value;
+}
+
+function extractExtensionText_(extensionData) {
+  const texts = [];
+  const textKeys = new Set([
+    'description', 'additionalText', 'basicText', 'text',
+    'headline', 'heading', 'name', 'title'
+  ]);
+  function visit(value) {
+    if (!value || typeof value !== 'object') return;
+    Object.entries(value).forEach(([key, child]) => {
+      if (textKeys.has(key) && (typeof child === 'string' || typeof child === 'number')) {
+        const text = String(child).trim();
+        if (text && !texts.includes(text)) texts.push(text);
+      } else if (typeof child === 'object') {
+        visit(child);
+      }
+    });
+  }
+  visit(extensionData);
+  return texts.join(' | ');
+}
+
+function buildNaverShoppingCreativeExtensions() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) throw new Error('이미 동일한 업데이트가 실행 중입니다.');
+  try {
+    const campaigns = naverGet_('/ncc/campaigns');
+    const adgroups = naverGet_('/ncc/adgroups');
+    const shoppingCampaigns = campaigns.filter(
+      campaign => campaign.campaignTp === 'SHOPPING'
+    );
+    const campaignMap = {};
+    shoppingCampaigns.forEach(campaign => {
+      campaignMap[campaign.nccCampaignId] = campaign;
+    });
+    const shoppingAdgroups = adgroups.filter(
+      adgroup => Boolean(campaignMap[adgroup.nccCampaignId])
+    );
+
+    const adLists = naverGetBatch_(shoppingAdgroups.map(adgroup => ({
+      uri: '/ncc/ads',
+      params: { nccAdgroupId: adgroup.nccAdgroupId }
+    })));
+    const ads = [];
+    adLists.forEach((adList, index) => {
+      const adgroup = shoppingAdgroups[index];
+      adList.forEach(ad => ads.push({ ad, adgroup }));
+    });
+
+    const extensionLists = naverGetBatch_(ads.map(item => ({
+      uri: '/ncc/ad-extensions',
+      params: { ownerId: item.ad.nccAdId }
+    })));
+    const output = [];
+    ads.forEach((item, index) => {
+      const ad = item.ad;
+      const adgroup = item.adgroup;
+      const campaign = campaignMap[adgroup.nccCampaignId];
+      const adData = parseJsonValue_(ad.ad);
+      const adAttr = parseJsonValue_(ad.adAttr);
+      const extensions = extensionLists[index] || [];
+      const productName = firstValue_([
+        adData.productName, adData.name, adData.title,
+        adData.product && adData.product.name
+      ]);
+      const imageUrl = firstValue_([
+        adData.imageUrl, adData.imagePath, adData.image,
+        adData.product && (adData.product.imageUrl || adData.product.image)
+      ]);
+      const productId = firstValue_([
+        adData.productId, adData.nvmid, adData.nvMid,
+        adData.product && (adData.product.id || adData.product.productId)
+      ]);
+      const extensionRows = extensions.length ? extensions : [null];
+      extensionRows.forEach(extension => {
+        const extensionData = extension ? parseJsonValue_(extension.adExtension) : {};
+        output.push([
+          campaign.name || '',
+          campaign.nccCampaignId || '',
+          adgroup.name || '',
+          adgroup.nccAdgroupId || '',
+          ad.nccAdId || '',
+          ad.type || '',
+          sheetCellValue_(productName),
+          sheetCellValue_(productId),
+          sheetCellValue_(imageUrl),
+          firstValue_([adAttr.bidAmt, adData.bidAmt]),
+          firstValue_([adAttr.useGroupBidAmt, adData.useGroupBidAmt]),
+          ad.status || '',
+          ad.statusReason || '',
+          ad.inspectStatus || '',
+          extension ? extension.nccAdExtensionId || '' : '',
+          extension ? extension.type || '' : '',
+          extension ? extractExtensionText_(extensionData) : '',
+          extension ? extension.status || '' : '',
+          extension ? extension.statusReason || '' : '',
+          extension ? extension.inspectStatus || '' : '',
+          extension ? extension.userLock : '',
+          extension ? extension.periodStartDt || '' : '',
+          extension ? extension.periodEndDt || '' : '',
+          extension ? extension.regTm || '' : '',
+          extension ? extension.editTm || '' : '',
+          JSON.stringify(adData),
+          extension ? JSON.stringify(extensionData) : ''
+        ]);
+      });
+    });
+    output.sort((a, b) =>
+      String(a[0]).localeCompare(String(b[0])) ||
+      String(a[2]).localeCompare(String(b[2])) ||
+      String(a[4]).localeCompare(String(b[4])) ||
+      String(a[15]).localeCompare(String(b[15]))
+    );
+    writeShoppingCreativeSheet_(output);
+    console.log(
+      `쇼핑검색 소재 업데이트 완료: 캠페인 ${shoppingCampaigns.length}개, ` +
+      `광고그룹 ${shoppingAdgroups.length}개, 소재 ${ads.length}개, 출력 ${output.length}행`
+    );
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function writeShoppingCreativeSheet_(output) {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = spreadsheet.getSheetByName(SHOPPING_CREATIVE_SHEET_NAME) ||
+    spreadsheet.insertSheet(SHOPPING_CREATIVE_SHEET_NAME);
+  const headers = [
+    '캠페인', '캠페인ID', '광고그룹', '광고그룹ID', '소재ID', '소재유형',
+    '상품명', '상품ID', '이미지URL', '소재입찰가', '그룹입찰가사용',
+    '소재상태', '소재상태사유', '소재검토상태',
+    '확장소재ID', '확장소재유형', '추가홍보문구/확장소재내용',
+    '확장소재상태', '확장소재상태사유', '확장소재검토상태', '확장소재중지',
+    '노출시작일', '노출종료일', '확장소재등록일', '확장소재수정일',
+    '소재원본JSON', '확장소재원본JSON'
+  ];
+  const existingFilter = sheet.getFilter();
+  if (existingFilter) existingFilter.remove();
+  sheet.clearContents();
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  if (!output.length) {
+    sheet.getRange(2, 1).setValue('조회 가능한 쇼핑검색 광고 소재가 없습니다.');
+    return;
+  }
+  sheet.getRange(2, 1, output.length, headers.length).setValues(output);
+  [2, 4, 5, 8, 15].forEach(column =>
+    sheet.getRange(2, column, output.length, 1).setNumberFormat('@')
+  );
+  sheet.getRange(2, 10, output.length, 1).setNumberFormat('#,##0');
+  sheet.setFrozenRows(1);
+  sheet.getRange(1, 1, 1, headers.length).createFilter();
+  sheet.autoResizeColumns(1, headers.length);
+  SpreadsheetApp.flush();
+}
+
 function formatApiDateKst_(value) {
   return Utilities.formatDate(new Date(value), TIME_ZONE, 'yyyy-MM-dd');
 }
@@ -67,9 +281,10 @@ function buildAdrielDailyBrandCosts() {
   try {
     const campaigns = naverGet_('/ncc/campaigns');
     const adgroups = naverGet_('/ncc/adgroups');
+    // 취소 계약은 원래 계약 종료일까지 비용이 생성될 수 있으므로 제외한다.
+    // 과거 실적은 정상적으로 노출이 완료된 계약(EXPOSE_COMPLETED)만 포함한다.
     const allowedStatuses = [
-      'UPCOMING_EXPOSE', 'ON_EXPOSING', 'UPCOMING_CANCEL',
-      'CANCELED_ON_EXPOSING', 'EXPOSE_COMPLETED'
+      'UPCOMING_EXPOSE', 'ON_EXPOSING', 'EXPOSE_COMPLETED'
     ];
     const yesterday = new Date();
     yesterday.setDate(yesterday.getDate() - 1);
@@ -99,6 +314,8 @@ function buildAdrielDailyBrandCosts() {
       const contracts = naverGet_(contractUri, { adgroupId: adgroup.nccAdgroupId });
       contracts.forEach(contract => {
         if (!allowedStatuses.includes(contract.contractStatus)) return;
+        // 실제 노출 기간을 우선 사용한다. 정상 계약인데 실제 노출일이
+        // 비어 있는 API 응답은 계약 시작·종료일을 보조값으로 사용한다.
         const startValue = contract.exposureStartDt || contract.contractStartDt;
         const endValue = contract.exposureEndDt || contract.contractEndDt;
         if (!startValue || !endValue) return;
@@ -118,14 +335,13 @@ function buildAdrielDailyBrandCosts() {
         );
         const totalCostExVat = Math.round(netPaymentInclVat / 1.1);
         if (totalCostExVat <= 0) return;
-        const basicDailyCost = Math.floor(totalCostExVat / contractDays);
-        const remainder = totalCostExVat - basicDailyCost * contractDays;
+        // 입력RAW의 계산 방식과 맞추기 위해 일별 금액을 반올림한다.
+        const dailyCost = Math.round(totalCostExVat / contractDays);
         for (let dayIndex = 0; dayIndex < outputDays; dayIndex++) {
           const currentDate = new Date(
             startDate.getTime() + dayIndex * MILLISECONDS_PER_DAY
           );
           const dateText = Utilities.formatDate(currentDate, TIME_ZONE, 'yyyy-MM-dd');
-          const dailyCost = basicDailyCost + (dayIndex < remainder ? 1 : 0);
           const campaignId = campaign.nccCampaignId || '';
           const adgroupId = contract.nccAdgroupId || adgroup.nccAdgroupId || '';
           const customerId = String(
