@@ -1,4 +1,4 @@
-# Naver fixed-cost ads to Adriel
+# 브랜드검색/신제품검색 광고 비용 자동 적재
 
 네이버 검색광고의 브랜드검색과 신제품검색 계약을 조회해 Google Sheets의 `Adriel_연동` 탭에 일별 광고비로 작성하는 Google Apps Script입니다.
 
